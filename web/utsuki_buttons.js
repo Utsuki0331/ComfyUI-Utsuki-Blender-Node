@@ -4,9 +4,19 @@ app.registerExtension({
     name: "Utsuki.BlenderUI",
     
     nodeCreated(node) {
-        // 同时匹配 AnimationRender 和 FrameRender
         if (node.comfyClass.includes("UtsukiBlender") && node.comfyClass.includes("Render")) {
             if (node.widgets.find(w => w.name === "select_blend_btn")) return;
+
+            // 0. 注入持久化 UUID
+            const persistWidget = node.widgets.find(w => w.name === "persist_id");
+            if (persistWidget) {
+                if (!persistWidget.value) {
+                    persistWidget.value = Math.random().toString(36).substring(2, 10) + Math.random().toString(36).substring(2, 10);
+                }
+                // 在画布上隐藏这个输入框，保证 UI 整洁
+                persistWidget.computeSize = () => [0, -4]; 
+                persistWidget.draw = () => {};
+            }
 
             // 1. 浏览文件按钮
             const blendPathIndex = node.widgets.findIndex(w => w.name === "blend_path");
@@ -19,16 +29,40 @@ app.registerExtension({
                             const resp = await fetch("/utsuki/select_blend_files");
                             const data = await resp.json();
                             if (data.paths && data.paths.length > 0) {
+                                const choice = prompt(
+                                    "请选择要生成的节点类型（输入数字 1/2/3）：\n\n" +
+                                    "1 - 生成 Blend File 节点\n" +
+                                    "2 - 生成 Animation Render 节点\n" +
+                                    "3 - 生成 Frame Render 节点",
+                                    "2"
+                                );
+                                if (!["1", "2", "3"].includes(choice)) return;
+
+                                const nodeTypeMap = {
+                                    "1": "UtsukiBlendFile",
+                                    "2": "UtsukiBlenderAnimationRender",
+                                    "3": "UtsukiBlenderFrameRender"
+                                };
+                                const targetClass = nodeTypeMap[choice];
+
                                 node.widgets[blendPathIndex].value = data.paths[0];
-                                if (node.widgets[blendPathIndex].callback) node.widgets[blendPathIndex].callback(data.paths[0]);
-                                let startX = node.pos[0] - 320, startY = node.pos[1];
+                                if (node.widgets[blendPathIndex].callback) {
+                                    node.widgets[blendPathIndex].callback(data.paths[0]);
+                                }
+
+                                let startX = node.pos[0] - 380;
+                                let startY = node.pos[1];
+
                                 data.paths.forEach((path, i) => {
-                                    const newFileNode = LiteGraph.createNode("UtsukiBlendFile");
-                                    if (newFileNode) {
-                                        newFileNode.pos = [startX, startY + i * 120];
-                                        const pathWidget = newFileNode.widgets.find(w => w.name === "blend_path");
+                                    const newNode = LiteGraph.createNode(targetClass);
+                                    if (newNode) {
+                                        const yOffset = (targetClass === "UtsukiBlendFile") ? 120 : 550;
+                                        newNode.pos = [startX, startY + i * yOffset];
+                                        
+                                        const pathWidget = newNode.widgets.find(w => w.name === "blend_path");
                                         if (pathWidget) pathWidget.value = path;
-                                        app.graph.add(newFileNode);
+                                        
+                                        app.graph.add(newNode);
                                     }
                                 });
                                 app.graph.setDirtyCanvas(true, true);
@@ -70,12 +104,12 @@ app.registerExtension({
                 });
             }
 
-            // 3. 构建原生 DOM 进度条
+            // 3. 构建 DOM 进度条 (默认隐藏)
             const progressBarContainer = document.createElement("div");
             progressBarContainer.style.cssText = "width:100%; margin-top:8px; padding:4px; box-sizing:border-box; background:#222; border-radius:4px; color:#fff; font-size:12px; font-family:sans-serif; display:none;";
             
             const progressText = document.createElement("div");
-            progressText.innerText = "等待渲染...";
+            progressText.innerText = "准备渲染...";
             progressText.style.marginBottom = "4px";
 
             const progressTrack = document.createElement("div");
@@ -117,7 +151,7 @@ app.registerExtension({
                     textArea.value = message.text[0];
                 }
                 if (node.utsukiProgress) {
-                    node.utsukiProgress.container.style.display = "none";
+                    node.utsukiProgress.container.style.display = "none"; // 跑完后隐藏
                 }
                 app.graph.setDirtyCanvas(true, true);
             };
@@ -140,16 +174,32 @@ app.registerExtension({
                 const msg = JSON.parse(event.data);
                 if (msg.type === "utsuki_progress") {
                     const data = msg.data;
-                    const node = app.graph.getNodeById(Number(data.node_id));
+                    const nodeId = Number(data.node_id);
+                    const node = app.graph.getNodeById(nodeId);
                     
                     if (node && node.utsukiProgress) {
                         const ui = node.utsukiProgress;
-                        ui.container.style.display = "block";
+                        ui.container.style.display = "block"; // 收到第一条数据时显示
                         
-                        let pct = Math.min(100, (data.relative_frame / data.total) * 100);
+                        let pct = (data.current / data.total) * 100;
+                        if (isNaN(pct) || pct < 0) pct = 0;
+                        if (pct > 100) pct = 100;
+                        
                         ui.fill.style.width = `${pct}%`;
                         
-                        ui.text.innerText = `进度: ${data.relative_frame}/${data.total} | 当前帧: ${data.current_frame} | 耗时: ${data.elapsed} | 速度: ${data.fps} | 剩余: ${data.eta}`;
+                        // 时间格式化
+                        const formatTime = (sec) => {
+                            if (sec < 0) sec = 0;
+                            if (sec < 60) return `${Math.floor(sec)}s`;
+                            const m = Math.floor(sec / 60);
+                            const s = Math.floor(sec % 60);
+                            return `${m}m${s}s`;
+                        };
+
+                        const avgStr = data.avg_time > 0 ? formatTime(data.avg_time) : "-";
+                        const etaStr = data.eta > 0 ? formatTime(data.eta) : "-";
+
+                        ui.text.innerText = `进度: ${data.current}/${data.total} | 帧: ${data.frame} | 耗时: ${formatTime(data.elapsed)} | 单帧: ${avgStr} | 剩余: ${etaStr}`;
                         
                         app.graph.setDirtyCanvas(true, true);
                     }

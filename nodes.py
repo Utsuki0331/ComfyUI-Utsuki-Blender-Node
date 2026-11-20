@@ -11,8 +11,78 @@ import glob
 import torch
 import numpy as np
 import threading
+import requests
+import hmac
+import hashlib
+import base64
 from PIL import Image
 from server import PromptServer
+import comfy.model_management as mm
+import folder_paths
+
+# ============================================================
+# 飞书通知功能
+# ============================================================
+def send_feishu_notification(url, secret, notice_type, file_path, node_type, duration, log_lines, extra_info=""):
+    if not url or not url.strip():
+        return None
+
+    try:
+        url = url.strip()
+        secret = secret.strip() if secret else ""
+        
+        payload = {}
+        if secret:
+            timestamp = str(int(time.time()))
+            string_to_sign = f'{timestamp}\n{secret}'
+            hmac_code = hmac.new(string_to_sign.encode("utf-8"), digestmod=hashlib.sha256).digest()
+            sign = base64.b64encode(hmac_code).decode('utf-8')
+            payload["timestamp"] = timestamp
+            payload["sign"] = sign
+
+        if notice_type == "success":
+            title_color, title_text = "green", "✅ Blender 渲染成功"
+        elif notice_type == "skip":
+            title_color, title_text = "green", "✅ Blender 渲染已提前完成"
+        elif notice_type == "retry":
+            title_color, title_text = "orange", "⚠️ Blender 渲染崩溃，正在重试"
+        elif notice_type == "failed":
+            title_color, title_text = "red", "❌ Blender 渲染彻底失败"
+        elif notice_type == "timeout":
+            title_color, title_text = "red", "⏰ Blender 渲染超时终止"
+        else:
+            title_color, title_text = "grey", "Blender 渲染通知"
+
+        log_summary = ""
+        if log_lines:
+            log_summary = "\n".join(log_lines[-5:])
+            if len(log_summary) > 300:
+                log_summary = log_summary[-300:] + "..."
+
+        card_content = {
+            "config": {"wide_screen_mode": True},
+            "header": {"title": {"tag": "plain_text", "content": title_text}, "template": title_color},
+            "elements": [
+                {"tag": "div", "text": {"tag": "lark_md", "content": f"**文件:** `{os.path.basename(file_path)}`\n**类型:** {node_type}\n**耗时:** {duration}\n{extra_info}"}}
+            ]
+        }
+        
+        if log_summary and notice_type in ["retry", "failed", "timeout"]:
+            card_content["elements"].append({"tag": "div", "text": {"tag": "lark_md", "content": f"**错误摘要:**\n```text\n{log_summary}\n```"}})
+            
+        payload["msg_type"] = "interactive"
+        payload["card"] = card_content
+
+        headers = {'Content-Type': 'application/json'}
+        resp = requests.post(url, headers=headers, json=payload, timeout=5)
+        resp.raise_for_status()
+        
+        res_json = resp.json()
+        if res_json.get("code") != 0:
+            return f"飞书接口返回错误: {res_json.get('msg')} (Code: {res_json.get('code')})"
+        return None
+    except Exception as e:
+        return f"网络或解析异常: {str(e)}"
 
 # ============================================================
 # 跨平台：查询 .blend 文件的默认打开程序
@@ -87,7 +157,7 @@ def find_default_blender():
     return exe
 
 # ============================================================
-# 子进程注入脚本 (Runner) - 兼容动画和单帧列表，修复路径叠加
+# 子进程注入脚本 (Runner)
 # ============================================================
 RUNNER_SOURCE = '''
 import bpy
@@ -102,6 +172,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
 
 job_path = sys.argv[-1]
 progress_path = job_path + ".progress"
+cache_path = job_path + ".cache"
 
 try:
     with open(job_path, "r", encoding="utf-8") as f:
@@ -127,12 +198,28 @@ try:
     out_dir = bpy.path.abspath(scene.render.filepath)
     print(f"UTSUKI_OUT_DIR={out_dir}")
 
+    if job.get("force_start_frame", -1) != -1:
+        scene.frame_start = job["force_start_frame"]
+    if job.get("force_end_frame", -1) != -1:
+        scene.frame_end = job["force_end_frame"]
+
     frames_list = job.get("frames_list")
+    if not frames_list:
+        if job.get("step", -1) != -1: scene.frame_step = job["step"]
 
     def write_progress(scene, *args):
         try:
             with open(progress_path, "w") as f:
                 f.write(f"{scene.frame_current}")
+            
+            cache_data = {
+                "last_frame": scene.frame_current,
+                "real_start": scene.frame_start,
+                "real_end": scene.frame_end,
+                "step": scene.frame_step
+            }
+            with open(cache_path, "w") as cf:
+                json.dump(cache_data, cf)
         except:
             pass
 
@@ -140,37 +227,22 @@ try:
     print("UTSUKI_START_RENDER")
 
     if frames_list:
-        # 单帧列表渲染模式
         print(f"UTSUKI_TOTAL_FRAMES={len(frames_list)}")
-        
-        # 保存用户原本设置的带 ### 的基础路径
         original_filepath = scene.render.filepath
-        
         for f in frames_list:
             scene.frame_set(int(f))
-            
-            # 关键修复：每次循环前，必须先还原到原始路径，再解析，防止路径无限叠加
             scene.render.filepath = original_filepath
-            
             try:
                 resolved_path = scene.render.frame_path(frame=int(f))
                 scene.render.filepath = resolved_path
             except Exception:
                 pass
-                
             write_progress(scene)
             bpy.ops.render.render(write_still=True)
-            
-        # 渲染结束，把路径还原
         scene.render.filepath = original_filepath
     else:
-        # 动画渲染模式
-        if job.get("start_frame", -1) != -1: scene.frame_start = job["start_frame"]
-        if job.get("end_frame", -1) != -1: scene.frame_end = job["end_frame"]
-        if job.get("step", -1) != -1: scene.frame_step = job["step"]
-        
-        print(f"UTSUKI_RANGE={scene.frame_start},{scene.frame_end},{scene.frame_step}")
         write_progress(scene)
+        print(f"UTSUKI_RANGE={scene.frame_start},{scene.frame_end},{scene.frame_step}")
         bpy.ops.render.render(animation=True)
 
     print("UTSUKI_FINISH_RENDER")
@@ -182,12 +254,10 @@ except Exception as e:
     sys.exit(1)
 '''
 
-# ============================================================
-# 公共逻辑抽取（用于底层执行、监控进度、断点续传）
-# ============================================================
-def execute_blender_render(job_data, blend_path, timeout_minutes, max_retries, unique_id):
+def execute_blender_render(job_data, blend_path, timeout_minutes, max_retries, unique_id, persist_id, feishu_url, feishu_secret, node_type="Animation", render_mode="重启 (Restart)"):
     blender = find_default_blender() or shutil.which("blender") or shutil.which("blender.exe")
-    if not blender: return ("[Error] 未能定位 Blender。", "", torch.zeros((1, 64, 64, 3)))
+    if not blender: 
+        return ("[Error] 未能定位 Blender。", "", torch.zeros((1, 64, 64, 3)))
 
     node_id_str = str(unique_id) if unique_id is not None else "0"
     retries_left = max_retries
@@ -198,14 +268,66 @@ def execute_blender_render(job_data, blend_path, timeout_minutes, max_retries, u
     
     is_final_success = False
     is_timeout_killed = False
+    is_user_canceled = False
+    is_skipped = False
     
-    # 预估值，等待 Runner 解析后覆盖
-    total_frames = len(job_data["frames_list"]) if job_data.get("frames_list") else 250
-    actual_start_frame = job_data.get("start_frame", 1)
-    actual_end_frame = job_data.get("end_frame", 250)
-    actual_step = job_data.get("step", 1)
+    start_time_global = time.time()
 
-    # === 外层重试循环 ===
+    # 使用 persist_id + unique_id 作为文件名，保证断点文件稳定
+    temp_dir = folder_paths.get_temp_directory()
+    cache_dir = os.path.join(temp_dir, "utsuki_blender_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(blend_path))[0]
+    pid = persist_id if persist_id else "default"
+    cache_file = os.path.join(cache_dir, f"{base_name}_{pid}_{node_id_str}_info.json")
+
+    node_start = job_data.get("start_frame", -1)
+    node_end = job_data.get("end_frame", -1)
+    node_step = job_data.get("step", 1)
+    is_frames_list_mode = bool(job_data.get("frames_list"))
+
+    force_start = node_start
+    force_end = node_end
+
+    if render_mode.startswith("重启"):
+        if os.path.exists(cache_file): os.remove(cache_file)
+    else:
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r") as f:
+                    cache_data = json.load(f)
+                    last_frame = cache_data.get("last_frame", -1)
+                    real_end = cache_data.get("real_end", -1)
+                    cache_step = cache_data.get("step", node_step)
+                    
+                    effective_end = node_end if node_end != -1 else real_end
+                    
+                    if last_frame != -1 and effective_end != -1 and last_frame >= effective_end:
+                        raw_stdout_lines.append(f"[继续渲染] 缓存显示上次已渲染至第 {last_frame} 帧，已经达到或超过结束帧 {effective_end}，无需重复渲染。")
+                        is_final_success = True
+                        is_skipped = True
+                    elif last_frame != -1:
+                        if node_start != -1 and last_frame <= node_start:
+                            raw_stdout_lines.append(f"[继续渲染] 缓存进度 ({last_frame}) 未能超越节点起点 ({node_start})，将从 {node_start} 重新开始。")
+                            force_start = node_start
+                        else:
+                            force_start = last_frame + cache_step
+                            raw_stdout_lines.append(f"[继续渲染] 检测到历史进度，已渲染至第 {last_frame} 帧。将从 {force_start} 继续。")
+                            
+                        if is_frames_list_mode:
+                            flist = job_data.get("frames_list", [])
+                            job_data["frames_list"] = [f for f in flist if f > last_frame]
+            except Exception as e:
+                raw_stdout_lines.append(f"[Warning] 读取缓存失败: {e}，将重新渲染。")
+                if os.path.exists(cache_file): os.remove(cache_file)
+
+    if is_skipped:
+        raw_stdout = "\n".join(raw_stdout_lines)
+        duration_str = f"{int(time.time() - start_time_global)} 秒"
+        if feishu_url and feishu_url.strip():
+            send_feishu_notification(feishu_url, feishu_secret, "skip", blend_path, node_type, duration_str, [], "任务已提前完成，无需重试。")
+        return (raw_stdout, raw_stdout, torch.zeros((1, 64, 64, 3)))
+
     while True:
         tmp_dir = tempfile.gettempdir()
         job_id = f"utsuki_{int(time.time()*1000)}"
@@ -213,25 +335,40 @@ def execute_blender_render(job_data, blend_path, timeout_minutes, max_retries, u
         progress_path = job_path + ".progress"
         runner_path = os.path.join(tmp_dir, f"{job_id}_runner.py")
 
+        if is_frames_list_mode and not job_data.get("frames_list"):
+            is_final_success = True
+            break
+
+        job_data["force_start_frame"] = force_start
+        job_data["force_end_frame"] = force_end
+
         with open(runner_path, "w", encoding="utf-8") as f: f.write(RUNNER_SOURCE)
         with open(job_path, "w", encoding="utf-8") as f: json.dump(job_data, f)
 
+        runner_content = open(runner_path, "r", encoding="utf-8").read()
+        runner_content = runner_content.replace(
+            'cache_path = job_path + ".cache"',
+            f'cache_path = r"{cache_file}"'
+        )
+        with open(runner_path, "w", encoding="utf-8") as f: f.write(runner_content)
+
         cmd = [blender, "--background", blend_path, "--python", runner_path, "--", job_path]
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace')
+        creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', creationflags=creation_flags)
         
-        start_time = time.time()
-        current_frame = -1
         last_progress_time = time.time()
         running = True
 
-        # 线程1：读取终端日志
         def read_output():
-            nonlocal out_dir, img_file_path, total_frames, actual_start_frame, actual_end_frame, actual_step
+            nonlocal out_dir, img_file_path
             buffer = ""
             while True:
-                try: char = p.stdout.read(1)
+                try: 
+                    char = p.stdout.read(1)
                 except: break
                 if not char: break
+                if mm.processing_interrupted(): break
+
                 if char == '\n' or char == '\r':
                     if buffer.strip():
                         line = buffer.strip()
@@ -239,77 +376,84 @@ def execute_blender_render(job_data, blend_path, timeout_minutes, max_retries, u
                         
                         if line.startswith("UTSUKI_OUT_DIR="):
                             out_dir = line.replace("UTSUKI_OUT_DIR=", "").strip()
-                        if line.startswith("UTSUKI_TOTAL_FRAMES="):
-                            try: total_frames = int(line.replace("UTSUKI_TOTAL_FRAMES=", "").strip())
-                            except: pass
-                        if line.startswith("UTSUKI_RANGE="):
-                            try:
-                                s_f, e_f, s_p = map(int, line.replace("UTSUKI_RANGE=", "").strip().split(","))
-                                if len(raw_stdout_lines) < 100:
-                                    actual_start_frame, actual_end_frame, actual_step = s_f, e_f, s_p
-                                    total_frames = len(range(s_f, e_f + 1, s_p))
-                            except: pass
-                            
+                        
                         m_saved = re.search(r"Saved:\s*['\"]([^'\"]+\.(png|jpg|jpeg|exr|webp))['\"]", line, re.IGNORECASE)
-                        if m_saved and not img_file_path:
-                            img_file_path = m_saved.group(1)
+                        if m_saved and not img_file_path: img_file_path = m_saved.group(1)
+
+                        # 顺手读 JSON 更新进度
+                        if m_saved or "Fra:" in line or "UTSUKI_START_RENDER" in line:
+                            if os.path.exists(cache_file):
+                                try:
+                                    with open(cache_file, "r") as cf:
+                                        cdata = json.load(cf)
+                                        lf = cdata.get("last_frame", -1)
+                                        rs = cdata.get("real_start", 1)
+                                        re_end = cdata.get("real_end", 100)
+                                        st = cdata.get("step", 1)
+                                        
+                                        if is_frames_list_mode:
+                                            flist = job_data.get("frames_list", [])
+                                            idx = flist.index(lf) + 1 if lf in flist else 1
+                                            tot = len(flist)
+                                        else:
+                                            if lf != -1 and re_end != -1:
+                                                tot = len(range(rs, re_end + 1, st))
+                                                idx = len(range(rs, min(lf + 1, re_end + 1), st))
+                                            else:
+                                                tot, idx = 1, 1
+                                                
+                                        # 计算平均耗时和剩余时间
+                                        elapsed = time.time() - start_time_global
+                                        if idx > 0 and elapsed > 0:
+                                            avg_time = elapsed / idx
+                                            eta = avg_time * (tot - idx)
+                                        else:
+                                            avg_time, eta = 0, 0
+                                                
+                                        PromptServer.instance.send_sync("utsuki_progress", {
+                                            "node_id": node_id_str,
+                                            "current": idx,
+                                            "total": tot,
+                                            "frame": lf,
+                                            "elapsed": elapsed,
+                                            "avg_time": avg_time,
+                                            "eta": eta
+                                        })
+                                except: pass
                     buffer = ""
                 else:
                     buffer += char
 
-        # 线程2：监控进度文件、心跳超时检查、推送前端
-        def monitor_progress():
-            nonlocal current_frame, last_progress_time, is_timeout_killed
-            last_pushed_idx = -1
+        def monitor_timeout():
+            nonlocal last_progress_time, is_timeout_killed, is_user_canceled, running
+            last_frame_seen = -1
             while running and p.poll() is None:
+                if mm.processing_interrupted():
+                    is_user_canceled = True
+                    p.kill()
+                    running = False
+                    break
+                    
+                if os.path.exists(cache_file):
+                    try:
+                        with open(cache_file, "r") as f:
+                            cdata = json.load(f)
+                            curr_f = cdata.get("last_frame", -1)
+                            if curr_f != -1 and curr_f != last_frame_seen:
+                                last_frame_seen = curr_f
+                                last_progress_time = time.time()
+                    except: pass
+                    
                 now = time.time()
-                
-                # 超时强杀逻辑
                 if timeout_minutes > 0 and (now - last_progress_time) > timeout_minutes * 60:
                     is_timeout_killed = True
                     p.kill()
+                    running = False
                     break
-                
-                if os.path.exists(progress_path):
-                    try:
-                        with open(progress_path, "r") as pf:
-                            content = pf.read().strip()
-                            if content:
-                                new_frame = int(content)
-                                if new_frame != current_frame:
-                                    current_frame = new_frame
-                                    last_progress_time = time.time() # 重置心跳
-                                    
-                                    # 计算当前是第几张图
-                                    if job_data.get("frames_list"):
-                                        if current_frame in job_data["frames_list"]:
-                                            idx = job_data["frames_list"].index(current_frame) + 1
-                                        else:
-                                            idx = 1
-                                    else:
-                                        idx = len(range(actual_start_frame, min(current_frame + 1, actual_end_frame + 1), actual_step))
-
-                                    if idx != last_pushed_idx:
-                                        last_pushed_idx = idx
-                                        elapsed = time.time() - start_time
-                                        fps = idx / elapsed if elapsed > 0 else 0
-                                        eta = (total_frames - idx) / fps if fps > 0 and idx <= total_frames else 0
-                                        
-                                        PromptServer.instance.send_sync("utsuki_progress", {
-                                            "node_id": node_id_str,
-                                            "relative_frame": idx,
-                                            "total": total_frames,
-                                            "current_frame": current_frame,
-                                            "elapsed": f"{int(elapsed)}s",
-                                            "fps": f"{fps:.2f} f/s",
-                                            "eta": f"{int(eta)}s"
-                                        })
-                    except Exception:
-                        pass
-                time.sleep(0.3)
+                time.sleep(0.5)
 
         t1 = threading.Thread(target=read_output)
-        t2 = threading.Thread(target=monitor_progress)
+        t2 = threading.Thread(target=monitor_timeout)
         t1.start()
         t2.start()
 
@@ -319,61 +463,76 @@ def execute_blender_render(job_data, blend_path, timeout_minutes, max_retries, u
             raw_stdout_lines.append(f"节点异常: {e}")
         finally:
             running = False
+            try: p.stdout.close()
+            except: pass
             t1.join(timeout=1)
             t2.join(timeout=1)
-            p.terminate()
+            if p.poll() is None: p.kill()
             for pth in [job_path, progress_path, runner_path]:
                 if os.path.exists(pth): os.remove(pth)
 
+        if is_user_canceled:
+            return ("[已取消] 用户主动中断了渲染。", "\n".join(raw_stdout_lines), torch.zeros((1, 64, 64, 3)))
+        
         if is_timeout_killed:
-            break
+            raw_stdout = "\n".join(raw_stdout_lines)
+            duration_str = f"{int(time.time() - start_time_global)} 秒"
+            if feishu_url and feishu_url.strip():
+                send_feishu_notification(feishu_url, feishu_secret, "timeout", blend_path, node_type, duration_str, raw_stdout_lines)
+            return (f"[超时终止] 渲染超过 {timeout_minutes} 分钟无进展，已强制终止。", raw_stdout, torch.zeros((1, 64, 64, 3)))
 
-        # 判断是否成功
         if p.returncode == 0 and "UTSUKI_FINISH_RENDER" in "\n".join(raw_stdout_lines):
             is_final_success = True
             break
 
-        # 走到这里说明异常崩溃了，判断是否还有重试次数
         if retries_left > 0:
             retries_left -= 1
             raw_stdout_lines.append(f"\n[重试] 检测到中断，剩余 {retries_left} 次机会。")
             
-            # 剔除已渲染帧，更新续传起点
-            if job_data.get("frames_list"):
-                if current_frame in job_data["frames_list"]:
-                    idx = job_data["frames_list"].index(current_frame)
-                    job_data["frames_list"] = job_data["frames_list"][idx + 1:]
-                else:
-                    job_data["frames_list"] = []
+            last_f = -1
+            step_val = node_step
+            if os.path.exists(cache_file):
+                try:
+                    with open(cache_file, "r") as f:
+                        cdata = json.load(f)
+                        last_f = cdata.get("last_frame", -1)
+                        step_val = cdata.get("step", node_step)
+                except: pass
+
+            duration_str = f"{int(time.time() - start_time_global)} 秒"
+            if feishu_url and feishu_url.strip():
+                send_feishu_notification(feishu_url, feishu_secret, "retry", blend_path, node_type, duration_str, raw_stdout_lines)
+
+            if is_frames_list_mode:
+                if last_f != -1:
+                    flist = job_data.get("frames_list", [])
+                    job_data["frames_list"] = [f for f in flist if f > last_f]
             else:
-                job_data["start_frame"] = current_frame + actual_step
-                
-            if not job_data.get("frames_list") and "frames_list" in job_data:
-                # 如果是单帧模式且全渲染完了，当作成功
-                is_final_success = True
-                break
+                if last_f != -1:
+                    force_start = last_f + step_val
             continue
         else:
+            duration_str = f"{int(time.time() - start_time_global)} 秒"
+            if feishu_url and feishu_url.strip():
+                send_feishu_notification(feishu_url, feishu_secret, "failed", blend_path, node_type, duration_str, raw_stdout_lines)
             break
 
-    # ==========================================
-    # 整理返回结果
-    # ==========================================
     raw_stdout = "\n".join(raw_stdout_lines)
-    is_error = not is_final_success and not is_timeout_killed
+    is_error = not is_final_success
 
     node_log = ""
-    if is_timeout_killed:
-        node_log += f"[超时终止] 渲染超过 {timeout_minutes} 分钟无进展，已强制终止。\n"
-    elif is_error:
+    if is_error:
         node_log += f"[Utsuki Blender] 渲染失败！(重试耗尽或发生错误)\n"
         if "UTSUKI_PYTHON_ERROR=" in raw_stdout:
             node_log += f"脚本参数错误: {raw_stdout.split('UTSUKI_PYTHON_ERROR=')[1].split(chr(10))[0]}\n"
     else:
         node_log += "[Utsuki Blender] 渲染进程结束\n"
         if out_dir: node_log += f"输出目录：{out_dir}\n"
+        duration_str = f"{int(time.time() - start_time_global)} 秒"
+        if feishu_url and feishu_url.strip():
+            send_feishu_notification(feishu_url, feishu_secret, "success", blend_path, node_type, duration_str, [])
 
-    if not is_error and not is_timeout_killed and img_file_path and os.path.exists(img_file_path):
+    if not is_error and img_file_path and os.path.exists(img_file_path):
         try:
             img = Image.open(img_file_path).convert("RGB")
             img_np = np.array(img).astype(np.float32) / 255.0
@@ -410,6 +569,7 @@ class UtsukiBlenderAnimationRender:
         return {
             "required": {
                 "blend_path": ("STRING", {"multiline": False, "default": ""}),
+                "render_mode": (["重启 (Restart)", "继续 (Resume)"], {"default": "重启 (Restart)"}),
                 "render_engine": (["默认", "CYCLES", "BLENDER_EEVEE_NEXT", "BLENDER_EEVEE", "BLENDER_WORKBENCH"], {"default": "默认"}),
                 "camera_name": ("STRING", {"multiline": False, "default": ""}),
                 "start_frame": ("INT", {"default": -1, "min": -1, "max": 99999, "step": 1}),
@@ -420,7 +580,10 @@ class UtsukiBlenderAnimationRender:
                 "res_percent": ("INT", {"default": -1, "min": -1, "max": 1000, "step": 1}),
                 "timeout_minutes": ("INT", {"default": 0, "min": 0, "max": 9999, "step": 1}),
                 "max_retries": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1}),
+                "feishu_url": ("STRING", {"multiline": False, "default": "", "tooltip": "飞书机器人 Webhook 地址"}),
+                "feishu_secret": ("STRING", {"multiline": False, "default": "", "tooltip": "飞书机器人签名校验密钥"}),
                 "custom_params": ("STRING", {"multiline": True, "default": ""}),
+                "persist_id": ("STRING", {"default": ""}), # 新增持久化 ID
             },
             "optional": {"any_input": ("*", {})},
             "hidden": {"unique_id": "UNIQUE_ID"}
@@ -430,7 +593,7 @@ class UtsukiBlenderAnimationRender:
     RETURN_NAMES = ("node_log", "blender_log", "image")
     FUNCTION = "render"
 
-    def render(self, blend_path, render_engine, camera_name, start_frame, end_frame, step, res_x, res_y, res_percent, timeout_minutes, max_retries, custom_params, any_input=None, unique_id=None, **kwargs):
+    def render(self, blend_path, render_mode, render_engine, camera_name, start_frame, end_frame, step, res_x, res_y, res_percent, timeout_minutes, max_retries, feishu_url, feishu_secret, custom_params, persist_id, any_input=None, unique_id=None, **kwargs):
         blend_path = os.path.normpath(blend_path.strip().strip('"').strip("'")) if blend_path else ""
         job_data = {
             "engine": render_engine if render_engine != "默认" else None,
@@ -439,8 +602,7 @@ class UtsukiBlenderAnimationRender:
             "res_x": res_x, "res_y": res_y, "res_percent": res_percent,
             "custom_params": custom_params
         }
-        return execute_blender_render(job_data, blend_path, timeout_minutes, max_retries, unique_id)
-
+        return execute_blender_render(job_data, blend_path, timeout_minutes, max_retries, unique_id, persist_id, feishu_url, feishu_secret, node_type="动画渲染", render_mode=render_mode)
 
 class UtsukiBlenderFrameRender:
     CATEGORY = "Utsuki/Blender"
@@ -452,15 +614,19 @@ class UtsukiBlenderFrameRender:
         return {
             "required": {
                 "blend_path": ("STRING", {"multiline": False, "default": ""}),
+                "render_mode": (["重启 (Restart)", "继续 (Resume)"], {"default": "重启 (Restart)"}),
                 "render_engine": (["默认", "CYCLES", "BLENDER_EEVEE_NEXT", "BLENDER_EEVEE", "BLENDER_WORKBENCH"], {"default": "默认"}),
                 "camera_name": ("STRING", {"multiline": False, "default": ""}),
-                "frames_input": ("STRING", {"multiline": True, "default": "1, 5, 10", "tooltip": "输入需要渲染的帧号，用英文逗号隔开。支持空格和换行。"}),
+                "frames_input": ("STRING", {"multiline": True, "default": "1, 5, 10"}),
                 "res_x": ("INT", {"default": -1, "min": -1, "max": 8192, "step": 1}),
                 "res_y": ("INT", {"default": -1, "min": -1, "max": 8192, "step": 1}),
                 "res_percent": ("INT", {"default": -1, "min": -1, "max": 1000, "step": 1}),
                 "timeout_minutes": ("INT", {"default": 0, "min": 0, "max": 9999, "step": 1}),
                 "max_retries": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1}),
+                "feishu_url": ("STRING", {"multiline": False, "default": "", "tooltip": "飞书机器人 Webhook 地址"}),
+                "feishu_secret": ("STRING", {"multiline": False, "default": "", "tooltip": "飞书机器人签名校验密钥"}),
                 "custom_params": ("STRING", {"multiline": True, "default": ""}),
+                "persist_id": ("STRING", {"default": ""}), # 新增持久化 ID
             },
             "optional": {"any_input": ("*", {})},
             "hidden": {"unique_id": "UNIQUE_ID"}
@@ -470,10 +636,8 @@ class UtsukiBlenderFrameRender:
     RETURN_NAMES = ("node_log", "blender_log", "image")
     FUNCTION = "render"
 
-    def render(self, blend_path, render_engine, camera_name, frames_input, res_x, res_y, res_percent, timeout_minutes, max_retries, custom_params, any_input=None, unique_id=None, **kwargs):
+    def render(self, blend_path, render_mode, render_engine, camera_name, frames_input, res_x, res_y, res_percent, timeout_minutes, max_retries, feishu_url, feishu_secret, custom_params, persist_id, any_input=None, unique_id=None, **kwargs):
         blend_path = os.path.normpath(blend_path.strip().strip('"').strip("'")) if blend_path else ""
-        
-        # 解析字符串：兼容中文逗号、英文逗号、空格、换行
         raw_tokens = re.split(r'[,\s，]+', frames_input.strip())
         frames_list = []
         for token in raw_tokens:
@@ -491,8 +655,7 @@ class UtsukiBlenderFrameRender:
             "res_x": res_x, "res_y": res_y, "res_percent": res_percent,
             "custom_params": custom_params
         }
-        return execute_blender_render(job_data, blend_path, timeout_minutes, max_retries, unique_id)
-
+        return execute_blender_render(job_data, blend_path, timeout_minutes, max_retries, unique_id, persist_id, feishu_url, feishu_secret, node_type="单帧渲染", render_mode=render_mode)
 
 NODE_CLASS_MAPPINGS = {
     "UtsukiBlenderAnimationRender": UtsukiBlenderAnimationRender,
