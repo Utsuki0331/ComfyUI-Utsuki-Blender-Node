@@ -13,7 +13,6 @@ app.registerExtension({
                 if (!persistWidget.value) {
                     persistWidget.value = Math.random().toString(36).substring(2, 10) + Math.random().toString(36).substring(2, 10);
                 }
-                // 在画布上隐藏这个输入框，保证 UI 整洁
                 persistWidget.computeSize = () => [0, -4]; 
                 persistWidget.draw = () => {};
             }
@@ -72,39 +71,7 @@ app.registerExtension({
                 });
             }
 
-            // 2. 刷新相机按钮
-            const camIndex = node.widgets.findIndex(w => w.name === "camera_name");
-            if (camIndex !== -1) {
-                node.widgets.splice(camIndex + 1, 0, {
-                    type: "button", name: "refresh_cam_btn", value: "",
-                    label: "🔄 刷新相机列表",
-                    callback: async () => {
-                        const bp = node.widgets.find(w => w.name === "blend_path").value;
-                        if (!bp) return alert("请先指定 .blend 文件");
-                        const btn = node.widgets.find(w => w.name === "refresh_cam_btn");
-                        btn.label = "⏳ 扫描中..."; app.graph.setDirtyCanvas(true, true);
-                        
-                        try {
-                            const resp = await fetch(`/utsuki/get_cameras?blend_path=${encodeURIComponent(bp)}`);
-                            const data = await resp.json();
-                            if (data.cameras && data.cameras.length > 0) {
-                                const sel = prompt("检测到以下相机，请选择或输入：\n\n" + data.cameras.join("\n"));
-                                if (sel) {
-                                    const camW = node.widgets.find(w => w.name === "camera_name");
-                                    camW.value = sel;
-                                    if (camW.callback) camW.callback(sel);
-                                }
-                            } else {
-                                alert("未检测到相机，或解析失败。");
-                            }
-                        } catch(e) { console.error(e); } finally {
-                            btn.label = "🔄 刷新相机列表"; app.graph.setDirtyCanvas(true, true);
-                        }
-                    }
-                });
-            }
-
-            // 3. 构建 DOM 进度条 (默认隐藏)
+            // 2. 构建 DOM 进度条 (默认隐藏)
             const progressBarContainer = document.createElement("div");
             progressBarContainer.style.cssText = "width:100%; margin-top:8px; padding:4px; box-sizing:border-box; background:#222; border-radius:4px; color:#fff; font-size:12px; font-family:sans-serif; display:none;";
             
@@ -127,7 +94,7 @@ app.registerExtension({
 
             node.utsukiProgress = { container: progressBarContainer, text: progressText, fill: progressFill };
 
-            // 4. 折叠日志
+            // 3. 折叠日志
             const details = document.createElement("details");
             details.style.cssText = "width:100%; padding:4px; box-sizing:border-box; background:#2a2a2a; border-radius:4px; margin-top:8px;";
             const summary = document.createElement("summary");
@@ -151,7 +118,7 @@ app.registerExtension({
                     textArea.value = message.text[0];
                 }
                 if (node.utsukiProgress) {
-                    node.utsukiProgress.container.style.display = "none"; // 跑完后隐藏
+                    node.utsukiProgress.container.style.display = "none";
                 }
                 app.graph.setDirtyCanvas(true, true);
             };
@@ -179,7 +146,7 @@ app.registerExtension({
                     
                     if (node && node.utsukiProgress) {
                         const ui = node.utsukiProgress;
-                        ui.container.style.display = "block"; // 收到第一条数据时显示
+                        ui.container.style.display = "block"; 
                         
                         let pct = (data.current / data.total) * 100;
                         if (isNaN(pct) || pct < 0) pct = 0;
@@ -187,7 +154,6 @@ app.registerExtension({
                         
                         ui.fill.style.width = `${pct}%`;
                         
-                        // 时间格式化
                         const formatTime = (sec) => {
                             if (sec < 0) sec = 0;
                             if (sec < 60) return `${Math.floor(sec)}s`;
