@@ -24,7 +24,6 @@ import folder_paths
 # 飞书通知功能辅助函数
 # ============================================================
 def format_duration(sec):
-    """将秒数格式化为时/分/秒"""
     sec = int(max(0, sec))
     h = sec // 3600
     m = (sec % 3600) // 60
@@ -175,7 +174,7 @@ def find_default_blender():
     return exe
 
 # ============================================================
-# 子进程注入脚本 (Runner) - 移除相机相关代码
+# 子进程注入脚本 (Runner) - 加入相机切换逻辑
 # ============================================================
 RUNNER_SOURCE = '''
 import bpy
@@ -203,7 +202,12 @@ try:
     if job.get("res_y", -1) != -1: scene.render.resolution_y = job["res_y"]
     if job.get("res_percent", -1) != -1: scene.render.resolution_percentage = int(job["res_percent"])
 
-    # 移除了 camera_name 判断
+    # 相机切换逻辑
+    cam_name = job.get("camera_name", "默认")
+    if cam_name and cam_name != "默认":
+        obj = bpy.data.objects.get(cam_name)
+        if obj and obj.type == 'CAMERA':
+            scene.camera = obj
 
     if job.get("custom_params", "").strip():
         try: exec(job["custom_params"], {"bpy": bpy})
@@ -567,7 +571,7 @@ def execute_blender_render(job_data, blend_path, timeout_minutes, max_retries, u
 
 
 # ============================================================
-# ComfyUI 节点注册 (移除了 camera_name)
+# ComfyUI 节点注册
 # ============================================================
 class UtsukiBlendFile:
     CATEGORY = "Utsuki/Blender"
@@ -593,6 +597,7 @@ class UtsukiBlenderAnimationRender:
                 "blend_path": ("STRING", {"multiline": False, "default": ""}),
                 "render_mode": (["重启 (Restart)", "继续 (Resume)"], {"default": "重启 (Restart)"}),
                 "render_engine": (["默认", "CYCLES", "BLENDER_EEVEE_NEXT", "BLENDER_EEVEE", "BLENDER_WORKBENCH"], {"default": "默认"}),
+                "camera_name": ("STRING", {"default": "默认", "tooltip": "选择或输入场景相机"}),
                 "start_frame": ("INT", {"default": -1, "min": -1, "max": 99999, "step": 1}),
                 "end_frame": ("INT", {"default": -1, "min": -1, "max": 99999, "step": 1}),
                 "step": ("INT", {"default": 1, "min": -1, "max": 1000, "step": 1}),
@@ -614,10 +619,11 @@ class UtsukiBlenderAnimationRender:
     RETURN_NAMES = ("node_log", "blender_log", "image")
     FUNCTION = "render"
 
-    def render(self, blend_path, render_mode, render_engine, start_frame, end_frame, step, res_x, res_y, res_percent, timeout_minutes, max_retries, feishu_url, feishu_secret, custom_params, persist_id, any_input=None, unique_id=None, **kwargs):
+    def render(self, blend_path, render_mode, render_engine, camera_name, start_frame, end_frame, step, res_x, res_y, res_percent, timeout_minutes, max_retries, feishu_url, feishu_secret, custom_params, persist_id, any_input=None, unique_id=None, **kwargs):
         blend_path = os.path.normpath(blend_path.strip().strip('"').strip("'")) if blend_path else ""
         job_data = {
             "engine": render_engine if render_engine != "默认" else None,
+            "camera_name": camera_name,
             "start_frame": start_frame, "end_frame": end_frame, "step": step,
             "res_x": res_x, "res_y": res_y, "res_percent": res_percent,
             "custom_params": custom_params
@@ -636,6 +642,7 @@ class UtsukiBlenderFrameRender:
                 "blend_path": ("STRING", {"multiline": False, "default": ""}),
                 "render_mode": (["重启 (Restart)", "继续 (Resume)"], {"default": "重启 (Restart)"}),
                 "render_engine": (["默认", "CYCLES", "BLENDER_EEVEE_NEXT", "BLENDER_EEVEE", "BLENDER_WORKBENCH"], {"default": "默认"}),
+                "camera_name": ("STRING", {"default": "默认", "tooltip": "选择或输入场景相机"}),
                 "frames_input": ("STRING", {"multiline": True, "default": "1, 5, 10"}),
                 "res_x": ("INT", {"default": -1, "min": -1, "max": 8192, "step": 1}),
                 "res_y": ("INT", {"default": -1, "min": -1, "max": 8192, "step": 1}),
@@ -655,7 +662,7 @@ class UtsukiBlenderFrameRender:
     RETURN_NAMES = ("node_log", "blender_log", "image")
     FUNCTION = "render"
 
-    def render(self, blend_path, render_mode, render_engine, frames_input, res_x, res_y, res_percent, timeout_minutes, max_retries, feishu_url, feishu_secret, custom_params, persist_id, any_input=None, unique_id=None, **kwargs):
+    def render(self, blend_path, render_mode, render_engine, camera_name, frames_input, res_x, res_y, res_percent, timeout_minutes, max_retries, feishu_url, feishu_secret, custom_params, persist_id, any_input=None, unique_id=None, **kwargs):
         blend_path = os.path.normpath(blend_path.strip().strip('"').strip("'")) if blend_path else ""
         raw_tokens = re.split(r'[,\s，]+', frames_input.strip())
         frames_list = []
@@ -669,6 +676,7 @@ class UtsukiBlenderFrameRender:
 
         job_data = {
             "engine": render_engine if render_engine != "默认" else None,
+            "camera_name": camera_name,
             "frames_list": frames_list,
             "res_x": res_x, "res_y": res_y, "res_percent": res_percent,
             "custom_params": custom_params
