@@ -72,7 +72,7 @@ app.registerExtension({
             }
 
             // ====================================================
-            // 2. 终极方案：原生下拉框 + 隐藏字符串
+            // 2. 原生下拉框 + 隐藏字符串 (完美版)
             // ====================================================
             const camIndex = node.widgets.findIndex(w => w.name === "camera_name");
             if (camIndex !== -1) {
@@ -82,32 +82,32 @@ app.registerExtension({
                 hiddenCamWidget.computeSize = () => [0, -4];
                 hiddenCamWidget.draw = () => {};
 
-                // B. 准备初始选项（必须包含"默认"和保存的旧值，防止没刷新时报错）
+                // B. 准备初始选项
                 let initValues = ["默认"];
                 if (hiddenCamWidget.value && hiddenCamWidget.value !== "默认") {
                     initValues.push(hiddenCamWidget.value);
                 }
 
-                // C. 创建一个真正的原生 COMBO 控件
+                // C. 创建原生 COMBO 控件
                 const comboWidget = node.addWidget("combo", "📷 选择相机", hiddenCamWidget.value || "默认", (value) => {
-                    // 当用户在下拉框选择时，把值同步给隐藏的字符串变量
                     hiddenCamWidget.value = value;
                     if (hiddenCamWidget.callback) hiddenCamWidget.callback(value);
                 }, {
                     values: initValues
                 });
 
-                // D. 将新下拉框移动到隐藏框原来的位置
+                // D. 将下拉框移动到隐藏框原来的位置
                 const newCamIndex = node.widgets.indexOf(comboWidget);
-                node.widgets.splice(newCamIndex, 1); // 从末尾移除
-                node.widgets.splice(camIndex, 0, comboWidget); // 插到原位置
+                node.widgets.splice(newCamIndex, 1); 
+                node.widgets.splice(camIndex, 0, comboWidget); 
 
                 // E. 刷新按钮
                 const refreshBtn = node.addWidget("button", "🔄 刷新相机列表", null, async () => {
                     const bp = node.widgets.find(w => w.name === "blend_path").value;
                     if (!bp) return alert("请先指定 .blend 文件");
                     
-                    refreshBtn.name = "🔄 刷新相机列表 (扫描中...)";
+                    // 修复按钮状态显示：使用 label 属性
+                    refreshBtn.label = "⏳ 扫描中...";
                     app.graph.setDirtyCanvas(true, true);
                     
                     try {
@@ -115,12 +115,9 @@ app.registerExtension({
                         const data = await resp.json();
                         
                         if (data.cameras && data.cameras.length > 0) {
-                            // 更新下拉框的选项列表
                             comboWidget.options.values = ["默认", ...data.cameras];
-                            // 去重
                             comboWidget.options.values = [...new Set(comboWidget.options.values)];
                             
-                            // 如果当前选中的不在新列表里，重置为默认
                             if (!comboWidget.options.values.includes(comboWidget.value)) {
                                 comboWidget.value = "默认";
                                 hiddenCamWidget.value = "默认";
@@ -134,7 +131,8 @@ app.registerExtension({
                     } catch(e) { 
                         console.error(e); 
                     } finally {
-                        refreshBtn.name = "🔄 刷新相机列表";
+                        // 恢复按钮文字
+                        refreshBtn.label = "🔄 刷新相机列表";
                         app.graph.setDirtyCanvas(true, true);
                     }
                 });
